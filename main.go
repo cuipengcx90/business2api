@@ -1180,18 +1180,22 @@ func formatImageAsMarkdown(mimeType, base64Data string) string {
 	return fmt.Sprintf("![image](data:%s;base64,%s)", mimeType, base64Data)
 }
 
-// 图片信息
-type ImageInfo struct {
-	MimeType string
-	Data     string // base64 数据
-	URL      string // 原始 URL（如果有）
-	IsURL    bool   // 是否使用 URL 直接上传
+// 媒体信息（图片/视频）
+type MediaInfo struct {
+	MimeType  string
+	Data      string // base64 数据
+	URL       string // 原始 URL（如果有）
+	IsURL     bool   // 是否使用 URL 直接上传
+	MediaType string // "image" 或 "video"
 }
 
-// 解析消息内容，支持文本和图片
-func parseMessageContent(msg Message) (string, []ImageInfo) {
+// 别名，保持向后兼容
+type ImageInfo = MediaInfo
+
+// 解析消息内容，支持文本、图片和视频
+func parseMessageContent(msg Message) (string, []MediaInfo) {
 	var textContent string
-	var images []ImageInfo
+	var medias []MediaInfo
 
 	switch content := msg.Content.(type) {
 	case string:
@@ -1212,50 +1216,35 @@ func parseMessageContent(msg Message) (string, []ImageInfo) {
 			case "image_url":
 				if imgURL, ok := partMap["image_url"].(map[string]interface{}); ok {
 					if urlStr, ok := imgURL["url"].(string); ok {
-						// 处理 base64 图片
-						if strings.HasPrefix(urlStr, "data:") {
-							// data:image/jpeg;base64,/9j/4AAQ...
-							parts := strings.SplitN(urlStr, ",", 2)
-							if len(parts) == 2 {
-								mimeType := "image/jpeg"
-								base64Data := parts[1]
-								needConvert := false
-								origFormat := ""
-
-								if strings.Contains(parts[0], "image/png") {
-									mimeType = "image/png"
-								} else if strings.Contains(parts[0], "image/jpeg") {
-									mimeType = "image/jpeg"
-								} else {
-									// 其他格式都需要转换为 PNG
-									needConvert = true
-									origFormat = parts[0]
-								}
-
-								if needConvert {
-									converted, err := convertBase64ToPNG(base64Data)
-									if err != nil {
-										log.Printf("⚠️ %s base64 转换失败: %v", origFormat, err)
-										// 回退到原格式，可能会失败
-									} else {
-										log.Printf("✅ %s base64 已转换为 PNG", origFormat)
-										base64Data = converted
-										mimeType = "image/png"
-									}
-								}
-
-								images = append(images, ImageInfo{
-									MimeType: mimeType,
-									Data:     base64Data,
-									IsURL:    false,
-								})
+						media := parseMediaURL(urlStr, "image")
+						if media != nil {
+							medias = append(medias, *media)
+						}
+					}
+				}
+			case "video_url":
+				// 支持视频 URL
+				if videoURL, ok := partMap["video_url"].(map[string]interface{}); ok {
+					if urlStr, ok := videoURL["url"].(string); ok {
+						media := parseMediaURL(urlStr, "video")
+						if media != nil {
+							medias = append(medias, *media)
+						}
+					}
+				}
+			case "file":
+				// 支持通用文件类型
+				if fileData, ok := partMap["file"].(map[string]interface{}); ok {
+					if urlStr, ok := fileData["url"].(string); ok {
+						mediaType := "image" // 默认图片
+						if mime, ok := fileData["mime_type"].(string); ok {
+							if strings.HasPrefix(mime, "video/") {
+								mediaType = "video"
 							}
-						} else {
-							// URL 图片 - 优先尝试直接使用 URL 上传
-							images = append(images, ImageInfo{
-								URL:   urlStr,
-								IsURL: true,
-							})
+						}
+						media := parseMediaURL(urlStr, mediaType)
+						if media != nil {
+							medias = append(medias, *media)
 						}
 					}
 				}
@@ -1263,10 +1252,95 @@ func parseMessageContent(msg Message) (string, []ImageInfo) {
 		}
 	}
 
-	return textContent, images
+	return textContent, medias
+}
+
+// 解析媒体 URL（图片或视频）
+func parseMediaURL(urlStr, defaultType string) *MediaInfo {
+	// 处理 base64 数据
+	if strings.HasPrefix(urlStr, "data:") {
+		// data:image/jpeg;base64,/9j/4AAQ... 或 data:video/mp4;base64,...
+		parts := strings.SplitN(urlStr, ",", 2)
+		if len(parts) != 2 {
+			return nil
+		}
+
+		base64Data := parts[1]
+		mediaType := defaultType
+		var mimeType string
+
+		// 检测媒体类型
+		if strings.Contains(parts[0], "video/") {
+			mediaType = "video"
+			// 视频格式处理
+			if strings.Contains(parts[0], "video/mp4") {
+				mimeType = "video/mp4"
+			} else if strings.Contains(parts[0], "video/webm") {
+				mimeType = "video/webm"
+			} else if strings.Contains(parts[0], "video/quicktime") || strings.Contains(parts[0], "video/mov") {
+				// MOV 格式，尝试作为 mp4 上传
+				mimeType = "video/mp4"
+				log.Printf("ℹ️ MOV 视频将作为 MP4 上传")
+			} else if strings.Contains(parts[0], "video/avi") || strings.Contains(parts[0], "video/x-msvideo") {
+				mimeType = "video/mp4"
+				log.Printf("ℹ️ AVI 视频将作为 MP4 上传")
+			} else {
+				// 其他视频格式默认作为 mp4
+				mimeType = "video/mp4"
+				log.Printf("ℹ️ 未知视频格式 %s 将作为 MP4 上传", parts[0])
+			}
+		} else {
+			mediaType = "image"
+			// 图片格式处理
+			if strings.Contains(parts[0], "image/png") {
+				mimeType = "image/png"
+			} else if strings.Contains(parts[0], "image/jpeg") {
+				mimeType = "image/jpeg"
+			} else {
+				// 其他图片格式需要转换为 PNG
+				converted, err := convertBase64ToPNG(base64Data)
+				if err != nil {
+					log.Printf("⚠️ %s base64 转换失败: %v", parts[0], err)
+					mimeType = "image/jpeg" // 回退
+				} else {
+					log.Printf("✅ %s base64 已转换为 PNG", parts[0])
+					base64Data = converted
+					mimeType = "image/png"
+				}
+			}
+		}
+
+		return &MediaInfo{
+			MimeType:  mimeType,
+			Data:      base64Data,
+			IsURL:     false,
+			MediaType: mediaType,
+		}
+	}
+
+	// URL 媒体 - 优先尝试直接使用 URL 上传
+	mediaType := defaultType
+	// 根据 URL 后缀推断媒体类型
+	lowerURL := strings.ToLower(urlStr)
+	if strings.HasSuffix(lowerURL, ".mp4") || strings.HasSuffix(lowerURL, ".webm") ||
+		strings.HasSuffix(lowerURL, ".mov") || strings.HasSuffix(lowerURL, ".avi") ||
+		strings.HasSuffix(lowerURL, ".mkv") || strings.HasSuffix(lowerURL, ".m4v") {
+		mediaType = "video"
+	}
+
+	return &MediaInfo{
+		URL:       urlStr,
+		IsURL:     true,
+		MediaType: mediaType,
+	}
 }
 
 func downloadImage(urlStr string) (string, string, error) {
+	return downloadMedia(urlStr, "image")
+}
+
+// downloadMedia 下载媒体文件（图片或视频）
+func downloadMedia(urlStr, mediaType string) (string, string, error) {
 	resp, err := httpClient.Get(urlStr)
 	if err != nil {
 		return "", "", err
@@ -1279,6 +1353,18 @@ func downloadImage(urlStr string) (string, string, error) {
 	}
 
 	mimeType := resp.Header.Get("Content-Type")
+
+	if mediaType == "video" || strings.HasPrefix(mimeType, "video/") {
+		// 视频处理
+		if mimeType == "" {
+			mimeType = "video/mp4"
+		}
+		// 规范化视频 MIME 类型
+		mimeType = normalizeVideoMimeType(mimeType)
+		return base64.StdEncoding.EncodeToString(data), mimeType, nil
+	}
+
+	// 图片处理
 	if mimeType == "" {
 		mimeType = "image/jpeg"
 	}
@@ -1296,6 +1382,30 @@ func downloadImage(urlStr string) (string, string, error) {
 	}
 
 	return base64.StdEncoding.EncodeToString(data), mimeType, nil
+}
+
+// normalizeVideoMimeType 规范化视频 MIME 类型
+func normalizeVideoMimeType(mimeType string) string {
+	switch {
+	case strings.Contains(mimeType, "mp4"):
+		return "video/mp4"
+	case strings.Contains(mimeType, "webm"):
+		return "video/webm"
+	case strings.Contains(mimeType, "quicktime"), strings.Contains(mimeType, "mov"):
+		log.Printf("ℹ️ MOV 视频将作为 MP4 上传")
+		return "video/mp4"
+	case strings.Contains(mimeType, "avi"), strings.Contains(mimeType, "x-msvideo"):
+		log.Printf("ℹ️ AVI 视频将作为 MP4 上传")
+		return "video/mp4"
+	case strings.Contains(mimeType, "x-matroska"), strings.Contains(mimeType, "mkv"):
+		log.Printf("ℹ️ MKV 视频将作为 MP4 上传")
+		return "video/mp4"
+	case strings.Contains(mimeType, "3gpp"):
+		return "video/3gpp"
+	default:
+		log.Printf("ℹ️ 未知视频格式 %s 将作为 MP4 上传", mimeType)
+		return "video/mp4"
+	}
 }
 
 // convertToPNG 将图片转换为 PNG 格式
@@ -1369,40 +1479,45 @@ func streamChat(c *gin.Context, req ChatRequest) {
 			continue
 		}
 
-		// 上传图片并获取 fileIds
+		// 上传媒体文件并获取 fileIds
 		var fileIds []string
 		uploadFailed := false
-		for _, img := range images {
+		for _, media := range images {
 			var fileId string
 			var err error
 
-			if img.IsURL {
+			mediaTypeName := "图片"
+			if media.MediaType == "video" {
+				mediaTypeName = "视频"
+			}
+
+			if media.IsURL {
 				// 优先尝试 URL 直接上传
-				fileId, err = uploadContextFileByURL(jwt, configID, session, img.URL, acc.Data.Authorization)
+				fileId, err = uploadContextFileByURL(jwt, configID, session, media.URL, acc.Data.Authorization)
 				if err != nil {
 					// URL 上传失败，回退到下载后上传
-					imageData, mimeType, dlErr := downloadImage(img.URL)
+					mediaData, mimeType, dlErr := downloadMedia(media.URL, media.MediaType)
 					if dlErr != nil {
-						log.Printf("⚠️ [%s] 图片下载失败: %v", acc.Data.Email, dlErr)
+						log.Printf("⚠️ [%s] %s下载失败: %v", acc.Data.Email, mediaTypeName, dlErr)
 						uploadFailed = true
 						break
 					}
-					fileId, err = uploadContextFile(jwt, configID, session, mimeType, imageData, acc.Data.Authorization)
+					fileId, err = uploadContextFile(jwt, configID, session, mimeType, mediaData, acc.Data.Authorization)
 				}
 			} else {
 				// base64 数据直接上传
-				fileId, err = uploadContextFile(jwt, configID, session, img.MimeType, img.Data, acc.Data.Authorization)
+				fileId, err = uploadContextFile(jwt, configID, session, media.MimeType, media.Data, acc.Data.Authorization)
 			}
 
 			if err != nil {
-				log.Printf("⚠️ [%s] 图片上传失败: %v", acc.Data.Email, err)
+				log.Printf("⚠️ [%s] %s上传失败: %v", acc.Data.Email, mediaTypeName, err)
 				uploadFailed = true
 				break
 			}
 			fileIds = append(fileIds, fileId)
 		}
 		if uploadFailed {
-			lastErr = fmt.Errorf("图片上传失败")
+			lastErr = fmt.Errorf("媒体上传失败")
 			continue
 		}
 
