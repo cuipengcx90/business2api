@@ -258,13 +258,13 @@ func debugScreenshot(page *rod.Page, threadID int, step string) {
 	log.Printf("[注册 %d] 📸 截图保存: %s", threadID, filename)
 }
 
-// handleAdditionalSteps 处理额外步骤（复选框、密码、公司信息等）
+// handleAdditionalSteps 处理额外步骤（复选框等）
 func handleAdditionalSteps(page *rod.Page, threadID int) bool {
 	log.Printf("[注册 %d] 检查是否需要处理额外步骤...", threadID)
 	
 	hasAdditionalSteps := false
 	
-	// 检查是否需要同意条款
+	// 检查是否需要同意条款（主要处理复选框）
 	checkboxResult, _ := page.Eval(`() => {
 		const checkboxes = document.querySelectorAll('input[type="checkbox"]');
 		for (const checkbox of checkboxes) {
@@ -279,85 +279,6 @@ func handleAdditionalSteps(page *rod.Page, threadID int) bool {
 	if checkboxResult != nil && checkboxResult.Value.Get("clicked").Bool() {
 		hasAdditionalSteps = true
 		log.Printf("[注册 %d] 已勾选条款复选框", threadID)
-		time.Sleep(1 * time.Second)
-	}
-	
-	// 检查是否需要输入密码
-	passwordResult, _ := page.Eval(`() => {
-		const passwordFields = document.querySelectorAll('input[type="password"]');
-		if (passwordFields.length > 0) {
-			for (const field of passwordFields) {
-				if (!field.value) {
-					field.value = 'TestPassword123!';
-					// 触发事件
-					field.dispatchEvent(new Event('input', { bubbles: true }));
-					field.dispatchEvent(new Event('change', { bubbles: true }));
-					return { set: true };
-				}
-			}
-		}
-		return { set: false };
-	}`)
-	
-	if passwordResult != nil && passwordResult.Value.Get("set").Bool() {
-		hasAdditionalSteps = true
-		log.Printf("[注册 %d] 已填写密码", threadID)
-		time.Sleep(1 * time.Second)
-	}
-	
-	// 检查是否需要公司信息
-	companyResult, _ := page.Eval(`() => {
-		const companySelectors = [
-			'input[name*="company"]',
-			'input[name*="organization"]',
-			'input[name*="business"]',
-			'input[placeholder*="Company"]',
-			'input[placeholder*="Organization"]'
-		];
-		
-		for (const selector of companySelectors) {
-			const elements = document.querySelectorAll(selector);
-			if (elements.length > 0 && !elements[0].value) {
-				elements[0].value = 'Test Company';
-				elements[0].dispatchEvent(new Event('input', { bubbles: true }));
-				return { set: true };
-			}
-		}
-		
-		return { set: false };
-	}`)
-	
-	if companyResult != nil && companyResult.Value.Get("set").Bool() {
-		hasAdditionalSteps = true
-		log.Printf("[注册 %d] 已填写公司名称", threadID)
-		time.Sleep(1 * time.Second)
-	}
-	
-	// 检查是否需要职位信息
-	roleResult, _ := page.Eval(`() => {
-		const roleFields = [
-			'input[name*="title"]',
-			'input[name*="role"]',
-			'input[name*="position"]',
-			'input[placeholder*="Title"]',
-			'input[placeholder*="Role"]'
-		];
-		
-		for (const selector of roleFields) {
-			const elements = document.querySelectorAll(selector);
-			if (elements.length > 0 && !elements[0].value) {
-				elements[0].value = 'Developer';
-				elements[0].dispatchEvent(new Event('input', { bubbles: true }));
-				return { set: true };
-			}
-		}
-		
-		return { set: false };
-	}`)
-	
-	if roleResult != nil && roleResult.Value.Get("set").Bool() {
-		hasAdditionalSteps = true
-		log.Printf("[注册 %d] 已填写职位", threadID)
 		time.Sleep(1 * time.Second)
 	}
 	
@@ -424,49 +345,9 @@ func checkAndHandleAdminPage(page *rod.Page, threadID int) bool {
 	if strings.Contains(currentURL, "/admin/create") {
 		log.Printf("[注册 %d] 检测到管理创建页面，尝试完成设置...", threadID)
 		
-		// 尝试填写必要的表单字段
+		// 尝试查找并点击继续按钮
 		formCompleted, _ := page.Eval(`() => {
 			let completed = false;
-			
-			// 查找公司名称字段
-			const companyFields = [
-				'input[name*="company"]',
-				'input[name*="organization"]',
-				'input[name*="business"]',
-				'input[placeholder*="Company"]',
-				'input[placeholder*="Organization"]'
-			];
-			
-			for (const selector of companyFields) {
-				const elements = document.querySelectorAll(selector);
-				if (elements.length > 0) {
-					elements[0].value = 'Test Company';
-					elements[0].dispatchEvent(new Event('input', { bubbles: true }));
-					completed = true;
-					console.log('填写公司名称');
-					break;
-				}
-			}
-			
-			// 查找职位字段
-			const roleFields = [
-				'input[name*="title"]',
-				'input[name*="role"]',
-				'input[name*="position"]',
-				'input[placeholder*="Title"]',
-				'input[placeholder*="Role"]'
-			];
-			
-			for (const selector of roleFields) {
-				const elements = document.querySelectorAll(selector);
-				if (elements.length > 0) {
-					elements[0].value = 'Developer';
-					elements[0].dispatchEvent(new Event('input', { bubbles: true }));
-					completed = true;
-					console.log('填写职位');
-					break;
-				}
-			}
 			
 			// 查找并点击继续按钮
 			const continueTexts = ['Continue', '继续', 'Next', 'Submit', 'Finish', '完成'];
@@ -501,7 +382,7 @@ func checkAndHandleAdminPage(page *rod.Page, threadID int) bool {
 		}`)
 		
 		if formCompleted != nil && formCompleted.Value.Bool() {
-			log.Printf("[注册 %d] 已填写管理表单，等待跳转...", threadID)
+			log.Printf("[注册 %d] 已处理管理表单，等待跳转...", threadID)
 			time.Sleep(5 * time.Second)
 			return true
 		}
@@ -931,7 +812,7 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 	page.WaitLoad()
 	time.Sleep(2 * time.Second)
 	
-	// 处理额外步骤（复选框、密码、公司信息等）
+	// 处理额外步骤（主要是复选框）
 	handleAdditionalSteps(page, threadID)
 	
 	// 检查并处理管理创建页面
