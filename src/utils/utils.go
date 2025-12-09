@@ -1,23 +1,25 @@
-package main
+package utils
 
 import (
-	"business2api/src/pool"
 	"bytes"
 	"compress/gzip"
 	"crypto/tls"
 	"encoding/json"
 	"io"
-	"log"
 	"net/http"
 	"net/url"
 	"time"
+
+	"business2api/src/logger"
+	"business2api/src/pool"
 )
 
 // ==================== HTTP 客户端 ====================
 
-var httpClient *http.Client
+var HTTPClient *http.Client
 
-func newHTTPClient() *http.Client {
+// NewHTTPClient 创建 HTTP 客户端
+func NewHTTPClient(proxy string) *http.Client {
 	transport := &http.Transport{
 		TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
 		MaxIdleConns:        100,
@@ -28,8 +30,8 @@ func newHTTPClient() *http.Client {
 		ForceAttemptHTTP2:   true,
 	}
 
-	if Proxy != "" {
-		proxyURL, err := url.Parse(Proxy)
+	if proxy != "" {
+		proxyURL, err := url.Parse(proxy)
 		if err == nil {
 			transport.Proxy = http.ProxyURL(proxyURL)
 		}
@@ -41,15 +43,17 @@ func newHTTPClient() *http.Client {
 	}
 }
 
-func initHTTPClient() {
-	httpClient = newHTTPClient()
-	pool.HTTPClient = httpClient
-	if Proxy != "" {
-		log.Printf("✅ 使用代理: %s", Proxy)
+// InitHTTPClient 初始化全局 HTTP 客户端
+func InitHTTPClient(proxy string) {
+	HTTPClient = NewHTTPClient(proxy)
+	pool.HTTPClient = HTTPClient
+	if proxy != "" {
+		logger.Info("✅ 使用代理: %s", proxy)
 	}
 }
 
-func readResponseBody(resp *http.Response) ([]byte, error) {
+// ReadResponseBody 读取 HTTP 响应体（支持 gzip）
+func ReadResponseBody(resp *http.Response) ([]byte, error) {
 	var reader io.Reader = resp.Body
 	if resp.Header.Get("Content-Encoding") == "gzip" {
 		gzReader, err := gzip.NewReader(resp.Body)
@@ -62,7 +66,8 @@ func readResponseBody(resp *http.Response) ([]byte, error) {
 	return io.ReadAll(reader)
 }
 
-func parseNDJSON(data []byte) []map[string]interface{} {
+// ParseNDJSON 解析 NDJSON 格式数据
+func ParseNDJSON(data []byte) []map[string]interface{} {
 	var result []map[string]interface{}
 	lines := bytes.Split(data, []byte("\n"))
 	for _, line := range lines {
@@ -78,7 +83,8 @@ func parseNDJSON(data []byte) []map[string]interface{} {
 	return result
 }
 
-func parseIncompleteJSONArray(data []byte) []map[string]interface{} {
+// ParseIncompleteJSONArray 解析可能不完整的 JSON 数组
+func ParseIncompleteJSONArray(data []byte) []map[string]interface{} {
 	var result []map[string]interface{}
 	if err := json.Unmarshal(data, &result); err == nil {
 		return result
@@ -91,11 +97,27 @@ func parseIncompleteJSONArray(data []byte) []map[string]interface{} {
 			if lastBrace > 0 {
 				fixed := append(trimmed[:lastBrace+1], ']')
 				if err := json.Unmarshal(fixed, &result); err == nil {
-					log.Printf("⚠️ JSON 数组不完整，已修复")
+					logger.Warn("JSON 数组不完整，已修复")
 					return result
 				}
 			}
 		}
 	}
 	return nil
+}
+
+// TruncateString 截断字符串
+func TruncateString(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
+}
+
+// Min 返回两个整数中的较小值
+func Min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }

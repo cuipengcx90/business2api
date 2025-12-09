@@ -3,6 +3,7 @@ module business2api
 go 1.25
 
 require (
+	github.com/fsnotify/fsnotify v1.9.0
 	github.com/gin-gonic/gin v1.9.1
 	github.com/go-rod/rod v0.116.2
 	github.com/go-rod/stealth v0.4.9

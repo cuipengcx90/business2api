@@ -66,6 +66,9 @@ func (h *GenerationHandler) HandleGeneration(req GenerationRequest, streamCb Str
 		}, nil
 	}
 
+	// 更新余额信息 (异步)
+	go h.updateTokenCredits(token)
+
 	// 确保 Project 存在
 	if err := h.ensureProjectExists(token); err != nil {
 		return &GenerationResult{
@@ -108,6 +111,26 @@ func (h *GenerationHandler) ensureATValid(token *FlowToken) error {
 
 	log.Printf("[Flow] Token %s AT 已刷新, 过期时间: %v", token.ID, token.ATExpires)
 	return nil
+}
+
+// updateTokenCredits 更新 Token 余额信息
+func (h *GenerationHandler) updateTokenCredits(token *FlowToken) {
+	if token.AT == "" {
+		return
+	}
+
+	resp, err := h.client.GetCredits(token.AT)
+	if err != nil {
+		log.Printf("[Flow] 查询余额失败: %v", err)
+		return
+	}
+
+	token.mu.Lock()
+	token.Credits = resp.Credits
+	token.UserPaygateTier = resp.UserPaygateTier
+	token.mu.Unlock()
+
+	log.Printf("[Flow] Token %s 余额: %d, Tier: %s", token.ID[:16]+"...", resp.Credits, resp.UserPaygateTier)
 }
 
 // ensureProjectExists 确保 Project 存在

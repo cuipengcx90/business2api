@@ -31,6 +31,7 @@ import (
 	"business2api/src/pool"
 	"business2api/src/proxy"
 	"business2api/src/register"
+	"business2api/src/utils"
 )
 
 // ==================== 配置结构 ====================
@@ -98,6 +99,7 @@ var (
 	remotePoolClient *pool.RemotePoolClient
 	flowClient       *flow.FlowClient
 	flowHandler      *flow.GenerationHandler
+	flowTokenPool    *flow.TokenPool
 )
 
 // APIStats API 调用统计
@@ -357,15 +359,15 @@ func loadAppConfig() {
 	configPath := "config/config.json"
 	if data, err := os.ReadFile(configPath); err == nil {
 		if err := json.Unmarshal(data, &appConfig); err != nil {
-			log.Printf("⚠️ 解析配置文件失败: %v，使用默认配置", err)
+			logger.Warn("⚠️ 解析配置文件失败: %v，使用默认配置", err)
 		} else {
-			log.Printf("✅ 加载配置文件: %s", configPath)
+			logger.Info("✅ 加载配置文件: %s", configPath)
 		}
 	} else if os.IsNotExist(err) {
 		// 配置文件不存在，创建默认配置
-		log.Printf("⚠️ 配置文件不存在，创建默认配置: %s", configPath)
+		logger.Warn("⚠️ 配置文件不存在，创建默认配置: %s", configPath)
 		if err := saveDefaultConfig(configPath); err != nil {
-			log.Printf("❌ 创建默认配置失败: %v", err)
+			logger.Error("❌ 创建默认配置失败: %v", err)
 		}
 	}
 	if v := os.Getenv("DATA_DIR"); v != "" {
@@ -431,7 +433,7 @@ func loadAppConfig() {
 
 // initFlowClient 初始化 Flow 客户端
 func initFlowClient() {
-	if !appConfig.Flow.Enable || len(appConfig.Flow.Tokens) == 0 {
+	if !appConfig.Flow.Enable {
 		logger.Info("📹 Flow 服务已禁用")
 		return
 	}
@@ -448,7 +450,16 @@ func initFlowClient() {
 
 	flowClient = flow.NewFlowClient(cfg)
 
-	// 添加 Tokens
+	// 初始化 Token 池
+	flowTokenPool = flow.NewTokenPool(DataDir, flowClient)
+
+	// 从 data/at 目录加载 Token
+	loadedFromDir, err := flowTokenPool.LoadFromDir()
+	if err != nil {
+		logger.Warn("⚠️ 从 data/at 加载 Flow Token 失败: %v", err)
+	}
+
+	// 添加配置文件中的 Tokens（兼容旧配置）
 	for i, st := range appConfig.Flow.Tokens {
 		token := &flow.FlowToken{
 			ID: fmt.Sprintf("flow_token_%d", i),
@@ -457,11 +468,25 @@ func initFlowClient() {
 		flowClient.AddToken(token)
 	}
 
+	totalTokens := loadedFromDir + len(appConfig.Flow.Tokens)
+	if totalTokens == 0 {
+		logger.Info("📹 Flow 服务已启用但无可用 Token (请将 cookie 放入 data/at/ 目录)")
+		flowHandler = flow.NewGenerationHandler(flowClient)
+		return
+	}
+
+	// 启动 AT 刷新 worker (每 30 分钟刷新一次)
+	flowTokenPool.StartRefreshWorker(30 * time.Minute)
+
+	// 启动文件监听 (自动加载新增 Token)
+	if err := flowTokenPool.StartWatcher(); err != nil {
+		logger.Warn("⚠️ Flow 文件监听启动失败: %v", err)
+	}
+
 	flowHandler = flow.NewGenerationHandler(flowClient)
-	logger.Info("📹 Flow 服务已启用，共 %d 个 Token", len(appConfig.Flow.Tokens))
+	logger.Info("📹 Flow 服务已启用，共 %d 个 Token (目录: %d, 配置: %d)", totalTokens, loadedFromDir, len(appConfig.Flow.Tokens))
 }
 
-// initProxyPool 初始化代理池 (内置 xray-core)
 func initProxyPool() {
 	// 添加订阅链接（新配置）
 	for _, sub := range appConfig.ProxyPool.Subscribes {
@@ -528,7 +553,6 @@ func initProxyPool() {
 	}
 }
 
-// BaseModels 基础模型（始终可用）
 var BaseModels = []string{
 	// Gemini 文本模型
 	"gemini-2.5-flash",
@@ -578,7 +602,6 @@ var FlowModels = []string{
 	"veo_3_0_r2v_fast_landscape",
 }
 
-// GetAvailableModels 获取当前可用的模型列表
 func GetAvailableModels() []string {
 	if flowHandler != nil {
 		// Flow 已启用，返回全部模型
@@ -641,7 +664,7 @@ func createSessionWithRetry(jwt, configID, origAuth string, maxRetries int) (str
 			// 等待后重试
 			waitTime := time.Duration(retry*500) * time.Millisecond
 			time.Sleep(waitTime)
-			log.Printf("🔄 createSession 重试 %d/%d", retry+1, maxRetries)
+			logger.Info("🔄 createSession 重试 %d/%d", retry+1, maxRetries)
 		}
 
 		sessionName, err := createSessionOnce(jwt, configID, origAuth)
@@ -654,7 +677,7 @@ func createSessionWithRetry(jwt, configID, origAuth string, maxRetries int) (str
 
 		// 400错误可以重试
 		if strings.Contains(errMsg, "400") {
-			log.Printf("⚠️ createSession 400 错误，尝试重试...")
+			logger.Warn("⚠️ createSession 400 错误，尝试重试...")
 			continue
 		}
 
@@ -686,13 +709,13 @@ func createSessionOnce(jwt, configID, origAuth string) (string, error) {
 		req.Header.Set(k, v)
 	}
 
-	resp, err := httpClient.Do(req)
+	resp, err := utils.HTTPClient.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("createSession 请求失败: %w", err)
 	}
 	defer resp.Body.Close()
 
-	respBody, err := readResponseBody(resp)
+	respBody, err := utils.ReadResponseBody(resp)
 	if err != nil {
 		return "", fmt.Errorf("读取响应失败: %w", err)
 	}
@@ -737,13 +760,13 @@ func uploadContextFile(jwt, configID, sessionName, mimeType, base64Content, orig
 		req.Header.Set(k, v)
 	}
 
-	resp, err := httpClient.Do(req)
+	resp, err := utils.HTTPClient.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("上传文件请求失败: %w", err)
 	}
 	defer resp.Body.Close()
 
-	respBody, err := readResponseBody(resp)
+	respBody, err := utils.ReadResponseBody(resp)
 	if err != nil {
 		return "", fmt.Errorf("读取响应失败: %w", err)
 	}
@@ -784,13 +807,13 @@ func uploadContextFileByURL(jwt, configID, sessionName, imageURL, origAuth strin
 		req.Header.Set(k, v)
 	}
 
-	resp, err := httpClient.Do(req)
+	resp, err := utils.HTTPClient.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("上传文件请求失败: %w", err)
 	}
 	defer resp.Body.Close()
 
-	respBody, err := readResponseBody(resp)
+	respBody, err := utils.ReadResponseBody(resp)
 	if err != nil {
 		return "", fmt.Errorf("读取响应失败: %w", err)
 	}
@@ -942,7 +965,7 @@ func extractContentFromReply(replyMap map[string]interface{}, jwt, session, conf
 			}
 			data, err := downloadGeneratedFile(jwt, fileId, session, configID, origAuth)
 			if err != nil {
-				log.Printf("❌ 下载%s失败: %v", fileType, err)
+				logger.Error("❌ 下载%s失败: %v", fileType, err)
 			} else {
 				imageData = data
 				imageMime = mimeType
@@ -981,23 +1004,23 @@ func downloadGeneratedFileWithRetry(jwt, fileId, session, configID, origAuth str
 
 		if strings.Contains(errMsg, "401") || strings.Contains(errMsg, "403") ||
 			strings.Contains(errMsg, "UNAUTHENTICATED") || strings.Contains(errMsg, "SESSION_COOKIE_INVALID") {
-			log.Printf("⚠️ 下载文件认证失败 (尝试 %d/%d): %v，尝试切换账号...", retry+1, maxRetries, err)
+			logger.Warn("⚠️ 下载文件认证失败 (尝试 %d/%d): %v，尝试切换账号...", retry+1, maxRetries, err)
 			newAcc := pool.Pool.Next()
 			if newAcc != nil {
 				newJWT, newConfigID, jwtErr := newAcc.GetJWT()
 				if jwtErr == nil {
-					log.Printf("✅ 切换到新账号: %s", newAcc.Data.Email)
+					logger.Info("✅ 切换到新账号: %s", newAcc.Data.Email)
 					currentJWT = newJWT
 					currentOrigAuth = newAcc.Data.Authorization
 					_ = newConfigID
 					continue
 				}
 			}
-			log.Printf("❌ 无法获取新账号，重试当前账号...")
+			logger.Error("❌ 无法获取新账号，重试当前账号...")
 		}
 
 		// 其他错误，等待后重试
-		log.Printf("❌ 下载文件失败 (尝试 %d/%d): %v", retry+1, maxRetries, err)
+		logger.Error("❌ 下载文件失败 (尝试 %d/%d): %v", retry+1, maxRetries, err)
 		time.Sleep(500 * time.Millisecond)
 	}
 
@@ -1023,13 +1046,13 @@ func downloadGeneratedFileOnce(jwt, fileId, session, configID, origAuth string) 
 		listReq.Header.Set(k, v)
 	}
 
-	listResp, err := httpClient.Do(listReq)
+	listResp, err := utils.HTTPClient.Do(listReq)
 	if err != nil {
 		return "", fmt.Errorf("获取文件元数据失败: %w", err)
 	}
 	defer listResp.Body.Close()
 
-	listRespBody, _ := readResponseBody(listResp)
+	listRespBody, _ := utils.ReadResponseBody(listResp)
 
 	if listResp.StatusCode != 200 {
 		return "", fmt.Errorf("获取文件元数据失败: HTTP %d: %s", listResp.StatusCode, string(listRespBody))
@@ -1068,13 +1091,13 @@ func downloadGeneratedFileOnce(jwt, fileId, session, configID, origAuth string) 
 		downloadReq.Header.Set(k, v)
 	}
 
-	downloadResp, err := httpClient.Do(downloadReq)
+	downloadResp, err := utils.HTTPClient.Do(downloadReq)
 	if err != nil {
 		return "", fmt.Errorf("下载图片失败: %w", err)
 	}
 	defer downloadResp.Body.Close()
 
-	imgBody, _ := readResponseBody(downloadResp)
+	imgBody, _ := utils.ReadResponseBody(downloadResp)
 
 	if downloadResp.StatusCode != 200 {
 		return "", fmt.Errorf("下载图片失败: HTTP %d: %s", downloadResp.StatusCode, string(imgBody))
@@ -1189,14 +1212,14 @@ func parseMediaURL(urlStr, defaultType string) *MediaInfo {
 			} else if strings.Contains(parts[0], "video/quicktime") || strings.Contains(parts[0], "video/mov") {
 				// MOV 格式，尝试作为 mp4 上传
 				mimeType = "video/mp4"
-				log.Printf("ℹ️ MOV 视频将作为 MP4 上传")
+				logger.Debug("ℹ️ MOV 视频将作为 MP4 上传")
 			} else if strings.Contains(parts[0], "video/avi") || strings.Contains(parts[0], "video/x-msvideo") {
 				mimeType = "video/mp4"
-				log.Printf("ℹ️ AVI 视频将作为 MP4 上传")
+				logger.Debug("ℹ️ AVI 视频将作为 MP4 上传")
 			} else {
 				// 其他视频格式默认作为 mp4
 				mimeType = "video/mp4"
-				log.Printf("ℹ️ 未知视频格式 %s 将作为 MP4 上传", parts[0])
+				logger.Debug("ℹ️ 未知视频格式 %s 将作为 MP4 上传", parts[0])
 			}
 		} else {
 			mediaType = "image"
@@ -1209,10 +1232,10 @@ func parseMediaURL(urlStr, defaultType string) *MediaInfo {
 				// 其他图片格式需要转换为 PNG
 				converted, err := convertBase64ToPNG(base64Data)
 				if err != nil {
-					log.Printf("⚠️ %s base64 转换失败: %v", parts[0], err)
+					logger.Warn("⚠️ %s base64 转换失败: %v", parts[0], err)
 					mimeType = "image/jpeg" // 回退
 				} else {
-					log.Printf("✅ %s base64 已转换为 PNG", parts[0])
+					logger.Info("✅ %s base64 已转换为 PNG", parts[0])
 					base64Data = converted
 					mimeType = "image/png"
 				}
@@ -1249,7 +1272,7 @@ func downloadImage(urlStr string) (string, string, error) {
 
 // downloadMedia 下载媒体文件（图片或视频）
 func downloadMedia(urlStr, mediaType string) (string, string, error) {
-	resp, err := httpClient.Get(urlStr)
+	resp, err := utils.HTTPClient.Get(urlStr)
 	if err != nil {
 		return "", "", err
 	}
@@ -1288,9 +1311,9 @@ func downloadMedia(urlStr, mediaType string) (string, string, error) {
 	if needConvert {
 		converted, err := convertToPNG(data)
 		if err != nil {
-			log.Printf("⚠️ %s 转换失败: %v，尝试原格式", mimeType, err)
+			logger.Warn("⚠️ %s 转换失败: %v，尝试原格式", mimeType, err)
 		} else {
-			log.Printf("✅ %s 已转换为 PNG", mimeType)
+			logger.Info("✅ %s 已转换为 PNG", mimeType)
 			return base64.StdEncoding.EncodeToString(converted), "image/png", nil
 		}
 	}
@@ -1306,18 +1329,18 @@ func normalizeVideoMimeType(mimeType string) string {
 	case strings.Contains(mimeType, "webm"):
 		return "video/webm"
 	case strings.Contains(mimeType, "quicktime"), strings.Contains(mimeType, "mov"):
-		log.Printf("ℹ️ MOV 视频将作为 MP4 上传")
+		logger.Debug("ℹ️ MOV 视频将作为 MP4 上传")
 		return "video/mp4"
 	case strings.Contains(mimeType, "avi"), strings.Contains(mimeType, "x-msvideo"):
-		log.Printf("ℹ️ AVI 视频将作为 MP4 上传")
+		logger.Debug("ℹ️ AVI 视频将作为 MP4 上传")
 		return "video/mp4"
 	case strings.Contains(mimeType, "x-matroska"), strings.Contains(mimeType, "mkv"):
-		log.Printf("ℹ️ MKV 视频将作为 MP4 上传")
+		logger.Debug("ℹ️ MKV 视频将作为 MP4 上传")
 		return "video/mp4"
 	case strings.Contains(mimeType, "3gpp"):
 		return "video/3gpp"
 	default:
-		log.Printf("ℹ️ 未知视频格式 %s 将作为 MP4 上传", mimeType)
+		logger.Debug("ℹ️ 未知视频格式 %s 将作为 MP4 上传", mimeType)
 		return "video/mp4"
 	}
 }
@@ -1759,7 +1782,7 @@ func handleFlowRequest(c *gin.Context, req ChatRequest, chatID string, createdTi
 		flusher.Flush()
 
 		if result != nil && !result.Success && result.Error != "" {
-			log.Printf("❌ [Flow] 生成失败: %s", result.Error)
+			logger.Error("❌ [Flow] 生成失败: %s", result.Error)
 		}
 	} else {
 		// 非流式响应
@@ -1822,7 +1845,7 @@ func streamChat(c *gin.Context, req ChatRequest) {
 	}()
 
 	// 入站日志
-	log.Printf("📥 [%s] 请求: model=%s ", clientIP, req.Model)
+	logger.Info("📥 [%s] 请求: model=%s ", clientIP, req.Model)
 
 	// 检查是否是 Flow 模型
 	if flow.IsFlowModel(req.Model) {
@@ -1914,22 +1937,22 @@ func streamChat(c *gin.Context, req ChatRequest) {
 			return
 		}
 		usedAcc = acc
-		log.Printf("📤 [%s] 使用账号: %s", clientIP, acc.Data.Email)
+		logger.Info("📤 [%s] 使用账号: %s", clientIP, acc.Data.Email)
 
 		if retry > 0 {
-			log.Printf("🔄 第 %d 次重试，切换账号: %s", retry+1, acc.Data.Email)
+			logger.Info("🔄 第 %d 次重试，切换账号: %s", retry+1, acc.Data.Email)
 		}
 
 		jwt, configID, err := acc.GetJWT()
 		if err != nil {
-			log.Printf("❌ [%s] 获取 JWT 失败: %v", acc.Data.Email, err)
+			logger.Error("❌ [%s] 获取 JWT 失败: %v", acc.Data.Email, err)
 			lastErr = err
 			continue
 		}
 
 		session, err := createSession(jwt, configID, acc.Data.Authorization)
 		if err != nil {
-			log.Printf("❌ [%s] 创建 Session 失败: %v", acc.Data.Email, err)
+			logger.Error("❌ [%s] 创建 Session 失败: %v", acc.Data.Email, err)
 			// 401 错误标记账号需要刷新
 			if strings.Contains(err.Error(), "401") || strings.Contains(err.Error(), "UNAUTHENTICATED") {
 				//		pool.Pool.MarkNeedsRefresh(acc)
@@ -1957,7 +1980,7 @@ func streamChat(c *gin.Context, req ChatRequest) {
 					// URL 上传失败，回退到下载后上传
 					mediaData, mimeType, dlErr := downloadMedia(media.URL, media.MediaType)
 					if dlErr != nil {
-						log.Printf("⚠️ [%s] %s下载失败: %v", acc.Data.Email, mediaTypeName, dlErr)
+						logger.Warn("⚠️ [%s] %s下载失败: %v", acc.Data.Email, mediaTypeName, dlErr)
 						if strings.Contains(dlErr.Error(), "UPSTREAM_401") || strings.Contains(dlErr.Error(), "UPSTREAM_403") {
 							c.JSON(500, gin.H{"error": gin.H{
 								"message": dlErr.Error(),
@@ -1975,7 +1998,7 @@ func streamChat(c *gin.Context, req ChatRequest) {
 				fileId, err = uploadContextFile(jwt, configID, session, media.MimeType, media.Data, acc.Data.Authorization)
 			}
 			if err != nil {
-				log.Printf("⚠️ [%s] %s上传失败: %v", acc.Data.Email, mediaTypeName, err)
+				logger.Warn("⚠️ [%s] %s上传失败: %v", acc.Data.Email, mediaTypeName, err)
 				uploadFailed = true
 				break
 			}
@@ -2030,23 +2053,23 @@ func streamChat(c *gin.Context, req ChatRequest) {
 			httpReq.Header.Set(k, v)
 		}
 
-		resp, err := httpClient.Do(httpReq)
+		resp, err := utils.HTTPClient.Do(httpReq)
 		if err != nil {
-			log.Printf("❌ [%s] 请求失败: %v", acc.Data.Email, err)
+			logger.Error("❌ [%s] 请求失败: %v", acc.Data.Email, err)
 			lastErr = err
 			continue
 		}
 
 		if resp.StatusCode != 200 {
-			body, _ := readResponseBody(resp)
+			body, _ := utils.ReadResponseBody(resp)
 			resp.Body.Close()
-			log.Printf("❌ [%s] Google 报错: %d %s (重试 %d/%d)", acc.Data.Email, resp.StatusCode, string(body), retry+1, maxRetries)
+			logger.Error("❌ [%s] Google 报错: %d %s (重试 %d/%d)", acc.Data.Email, resp.StatusCode, string(body), retry+1, maxRetries)
 			lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
 			lastErrStatusCode = resp.StatusCode
 			lastErrBody = body
 			// 401/403 无权限，标记需要刷新
 			if resp.StatusCode == 401 || resp.StatusCode == 403 {
-				log.Printf("⚠️ [%s] %d 无权限，标记需要刷新", acc.Data.Email, resp.StatusCode)
+				logger.Warn("⚠️ [%s] %d 无权限，标记需要刷新", acc.Data.Email, resp.StatusCode)
 				pool.Pool.MarkNeedsRefresh(acc)
 			}
 			// 429 限流，延长使用冷却时间（3倍冷却）
@@ -2055,7 +2078,7 @@ func streamChat(c *gin.Context, req ChatRequest) {
 				acc.Mu.Lock()
 				acc.LastUsed = time.Now().Add(cooldownTime)
 				acc.Mu.Unlock()
-				log.Printf("⏳ [%s] 429 限流，账号进入延长冷却 %v", acc.Data.Email, cooldownTime)
+				logger.Info("⏳ [%s] 429 限流，账号进入延长冷却 %v", acc.Data.Email, cooldownTime)
 				// 429不计入重试次数，等待后继续尝试其他账号
 				pool.Pool.MarkUsed(acc, false)
 				time.Sleep(1 * time.Second) // 短暂等待后切换账号
@@ -2067,23 +2090,44 @@ func streamChat(c *gin.Context, req ChatRequest) {
 		}
 
 		// 成功，读取响应
-		respBody, _ = readResponseBody(resp)
+		respBody, _ = utils.ReadResponseBody(resp)
 		resp.Body.Close()
+
+		// Debug 模式输出上游响应
+		if logger.IsDebug() {
+			respSnippet := string(respBody)
+			if len(respSnippet) > 2000 {
+				respSnippet = respSnippet[:2000] + "..."
+			}
+			logger.Debug("[%s] 上游响应: %s", acc.Data.Email, respSnippet)
+		}
 
 		// 快速检查是否是认证错误响应
 		if bytes.Contains(respBody, []byte("uToken")) && !bytes.Contains(respBody, []byte("streamAssistResponse")) {
-			log.Printf("⚠️ [%s] 收到认证响应，标记需要刷新", acc.Data.Email)
+			logger.Warn("[%s] 收到认证响应，标记需要刷新", acc.Data.Email)
 			pool.Pool.MarkNeedsRefresh(acc)
 			lastErr = fmt.Errorf("认证失败，需要刷新账号")
 			continue
 		}
 
 		// 检查是否有实际内容（非空返回）
-		hasContent := bytes.Contains(respBody, []byte(`"text"`)) || bytes.Contains(respBody, []byte(`"file"`)) || bytes.Contains(respBody, []byte(`"inlineData"`))
-		if !hasContent && bytes.Contains(respBody, []byte(`"thought"`)) {
-			// 只有思考内容，没有实际输出，重试
-			log.Printf("⚠️ [%s] 响应只有思考内容，无实际输出，重试 (%d/%d)", acc.Data.Email, retry+1, maxRetries)
-			lastErr = fmt.Errorf("空返回，只有思考内容")
+		hasText := bytes.Contains(respBody, []byte(`"text"`))
+		hasFile := bytes.Contains(respBody, []byte(`"file"`))
+		hasInlineData := bytes.Contains(respBody, []byte(`"inlineData"`))
+		hasThought := bytes.Contains(respBody, []byte(`"thought"`))
+		hasFunctionCall := bytes.Contains(respBody, []byte(`"functionCall"`))
+		hasContent := hasText || hasFile || hasInlineData || hasFunctionCall
+
+		// 响应完全为空或只有思考内容
+		if !hasContent {
+			if hasThought {
+				logger.Warn("[%s] 响应只有思考内容，无实际输出，重试 (%d/%d)", acc.Data.Email, retry+1, maxRetries)
+				lastErr = fmt.Errorf("空返回，只有思考内容")
+			} else {
+				logger.Warn("[%s] 响应无有效内容 (text/file/inlineData/functionCall)，重试 (%d/%d)", acc.Data.Email, retry+1, maxRetries)
+				lastErr = fmt.Errorf("空返回，无有效内容")
+			}
+			pool.Pool.MarkUsed(acc, false)
 			continue
 		}
 
@@ -2098,7 +2142,7 @@ func streamChat(c *gin.Context, req ChatRequest) {
 	}
 
 	if lastErr != nil {
-		log.Printf("❌ 所有重试均失败: %v", lastErr)
+		logger.Error("❌ 所有重试均失败: %v", lastErr)
 		// 如果有 HTTP 错误响应体，原样透传
 		if lastErrStatusCode > 0 && len(lastErrBody) > 0 {
 			c.Data(lastErrStatusCode, "application/json", lastErrBody)
@@ -2112,7 +2156,7 @@ func streamChat(c *gin.Context, req ChatRequest) {
 
 	// 检查空响应
 	if len(respBody) == 0 {
-		log.Printf("❌ 响应为空")
+		logger.Error("❌ 响应为空")
 		c.JSON(500, gin.H{"error": "Empty response from Google"})
 		return
 	}
@@ -2123,29 +2167,29 @@ func streamChat(c *gin.Context, req ChatRequest) {
 
 	// 1. 尝试标准 JSON 数组
 	if parseErr = json.Unmarshal(respBody, &dataList); parseErr != nil {
-		log.Printf("⚠️ JSON 数组解析失败: %v, 响应前100字符: %s", parseErr, string(respBody[:min(100, len(respBody))]))
+		logger.Warn("⚠️ JSON 数组解析失败: %v, 响应前100字符: %s", parseErr, string(respBody[:min(100, len(respBody))]))
 
 		// 2. 尝试修复不完整的 JSON 数组
-		dataList = parseIncompleteJSONArray(respBody)
+		dataList = utils.ParseIncompleteJSONArray(respBody)
 		if dataList == nil {
 			// 3. 尝试 NDJSON 格式
-			log.Printf("⚠️ 尝试 NDJSON 格式...")
-			dataList = parseNDJSON(respBody)
+			logger.Warn("⚠️ 尝试 NDJSON 格式...")
+			dataList = utils.ParseNDJSON(respBody)
 		}
 
 		if len(dataList) == 0 {
 			// 输出完整响应用于调试
 			respStr := string(respBody)
 			if len(respStr) > 500 {
-				log.Printf("❌ 所有解析方式均失败, 响应长度: %d, 前500字符: %s", len(respBody), respStr[:500])
-				log.Printf("❌ 后200字符: %s", respStr[len(respStr)-200:])
+				logger.Error("❌ 所有解析方式均失败, 响应长度: %d, 前500字符: %s", len(respBody), respStr[:500])
+				logger.Error("❌ 后200字符: %s", respStr[len(respStr)-200:])
 			} else {
-				log.Printf("❌ 所有解析方式均失败, 响应长度: %d, 完整响应: %s", len(respBody), respStr)
+				logger.Error("❌ 所有解析方式均失败, 响应长度: %d, 完整响应: %s", len(respBody), respStr)
 			}
 			c.JSON(500, gin.H{"error": "JSON Parse Error"})
 			return
 		}
-		log.Printf("✅ 备用解析成功，共 %d 个对象", len(dataList))
+		logger.Info("✅ 备用解析成功，共 %d 个对象", len(dataList))
 	}
 
 	// 检查是否有有效响应
@@ -2174,9 +2218,9 @@ func streamChat(c *gin.Context, req ChatRequest) {
 			}
 		}
 		if !hasValidResponse {
-			log.Printf("⚠️ 响应中没有 streamAssistResponse，响应内容: %v", dataList[0])
+			logger.Warn("⚠️ 响应中没有 streamAssistResponse，响应内容: %v", dataList[0])
 		}
-		log.Printf("📊 响应统计: %d 个数据块, 有效响应=%v, 包含文件=%v", len(dataList), hasValidResponse, hasFileContent)
+		logger.Debug("📊 响应统计: %d 个数据块, 有效响应=%v, 包含文件=%v", len(dataList), hasValidResponse, hasFileContent)
 	}
 
 	// 从响应中提取 session（用于下载图片）
@@ -2195,10 +2239,10 @@ func streamChat(c *gin.Context, req ChatRequest) {
 	// 如果响应中没有 session，使用请求时创建的 session 作为回退
 	if respSession == "" {
 		if usedSession != "" {
-			log.Printf("⚠️ 响应中未找到 session，使用请求时创建的 session: %s", usedSession)
+			logger.Warn("⚠️ 响应中未找到 session，使用请求时创建的 session: %s", usedSession)
 			respSession = usedSession
 		} else {
-			log.Printf("⚠️ 响应中未找到 session 且无回退 session，图片/视频下载可能失败")
+			logger.Warn("⚠️ 响应中未找到 session 且无回退 session，图片/视频下载可能失败")
 		}
 	} else {
 	}
@@ -2319,7 +2363,7 @@ func streamChat(c *gin.Context, req ChatRequest) {
 			}
 		}
 		if len(pendingFiles) > 0 {
-			log.Printf("📥 开始下载 %d 个文件...", len(pendingFiles))
+			logger.Info("📥 开始下载 %d 个文件...", len(pendingFiles))
 			type downloadResult struct {
 				Index    int
 				Data     string
@@ -2348,7 +2392,7 @@ func streamChat(c *gin.Context, req ChatRequest) {
 			// 按顺序输出
 			for i, r := range downloaded {
 				if r.Err != nil {
-					log.Printf("❌ 下载文件[%d]失败: %v", i, r.Err)
+					logger.Error("❌ 下载文件[%d]失败: %v", i, r.Err)
 					continue
 				}
 				imgMarkdown := formatImageAsMarkdown(r.MimeType, r.Data)
@@ -2420,7 +2464,7 @@ func streamChat(c *gin.Context, req ChatRequest) {
 		}
 		toolCalls := extractToolCalls(dataList)
 		// 调试日志
-		log.Printf("📊 非流式响应统计: %d 个 reply, 包含文件=%v, content长度=%d, reasoning长度=%d, 工具调用=%d",
+		logger.Debug("📊 非流式响应统计: %d 个 reply, 包含文件=%v, content长度=%d, reasoning长度=%d, 工具调用=%d",
 			replyCount, hasFile, fullContent.Len(), fullReasoning.Len(), len(toolCalls))
 
 		// 构建响应消息
@@ -2516,11 +2560,11 @@ func apiKeyAuth() gin.HandlerFunc {
 // runBrowserRefreshMode 有头浏览器刷新模式
 func runBrowserRefreshMode(email string) {
 	loadAppConfig()
-	initHTTPClient()
+	utils.InitHTTPClient(Proxy)
 
 	// 强制有头模式
 	pool.BrowserRefreshHeadless = false
-	log.Println("🌐 有头浏览器刷新模式")
+	logger.Info("🌐 有头浏览器刷新模式")
 
 	if err := pool.Pool.Load(DataDir); err != nil {
 		log.Fatalf("❌ 加载账号失败: %v", err)
@@ -2596,12 +2640,12 @@ func runBrowserRefreshMode(email string) {
 
 		// 保存到文件
 		if err := targetAcc.SaveToFile(); err != nil {
-			log.Printf("⚠️ 保存失败: %v", err)
+			logger.Warn("⚠️ 保存失败: %v", err)
 		} else {
-			log.Printf("💾 已保存到: %s", targetAcc.FilePath)
+			logger.Info("💾 已保存到: %s", targetAcc.FilePath)
 		}
 	} else {
-		log.Printf("❌ 刷新失败: %v", result.Error)
+		logger.Error("❌ 刷新失败: %v", result.Error)
 	}
 }
 
@@ -2616,10 +2660,10 @@ func main() {
 		switch arg {
 		case "--debug", "-d":
 			register.RegisterDebug = true
-			log.Println("🔧 调试模式已启用，将保存截图到 data/screenshots/")
+			logger.Info("🔧 调试模式已启用，将保存截图到 data/screenshots/")
 		case "--once":
 			register.RegisterOnce = true
-			log.Println("🔧 单次运行模式")
+			logger.Info("🔧 单次运行模式")
 		case "--refresh":
 			refreshMode = true
 			// 检查下一个参数是否是邮箱
@@ -2644,7 +2688,7 @@ func main() {
 	}
 
 	loadAppConfig()
-	initHTTPClient()
+	utils.InitHTTPClient(Proxy)
 	if appConfig.PoolServer.Enable {
 		switch appConfig.PoolServer.Mode {
 		case "client":
@@ -2660,7 +2704,7 @@ func main() {
 	runLocalMode()
 }
 func runAsClient() {
-	log.Println("🔌 启动客户端模式...")
+	logger.Info("🔌 启动客户端模式...")
 
 	// 代理实例池由异步健康检查完成后初始化
 	// 设置代理就绪检查回调
@@ -2726,7 +2770,7 @@ func runAsClient() {
 var poolServer *pool.PoolServer // 全局号池服务器实例
 
 func runAsServer() {
-	log.Println("🖥️ 启动服务器模式...")
+	logger.Info("🖥️ 启动服务器模式...")
 
 	// 加载账号
 	dataDir := appConfig.PoolServer.DataDir
@@ -2737,9 +2781,9 @@ func runAsServer() {
 		log.Fatalf("❌ 加载账号失败: %v", err)
 	}
 
-	log.Printf("   监听地址: %s", ListenAddr)
-	log.Printf("   WS 端点: %s/ws", ListenAddr)
-	log.Printf("   账号数量: %d", pool.Pool.TotalCount())
+	logger.Info("   监听地址: %s", ListenAddr)
+	logger.Info("   WS 端点: %s/ws", ListenAddr)
+	logger.Info("   账号数量: %d", pool.Pool.TotalCount())
 
 	// 创建号池服务器（WS 将集成到 API 服务中）
 	poolServer = pool.NewPoolServer(pool.Pool, appConfig.PoolServer)
@@ -2758,7 +2802,7 @@ func runAPIServer() {
 	r := gin.New()
 	r.Use(gin.Recovery())
 	setupAPIRoutes(r)
-	log.Printf("🚀 API 服务启动于 %s，账号: ready=%d, pending=%d", ListenAddr, pool.Pool.ReadyCount(), pool.Pool.PendingCount())
+	logger.Info("🚀 API 服务启动于 %s，账号: ready=%d, pending=%d", ListenAddr, pool.Pool.ReadyCount(), pool.Pool.PendingCount())
 	if err := r.Run(ListenAddr); err != nil {
 		log.Fatalf("❌ API 服务启动失败: %v", err)
 	}
@@ -2779,9 +2823,9 @@ func setupAPIRoutes(r *gin.Engine) {
 		statusCode := c.Writer.Status()
 
 		if statusCode >= 400 {
-			log.Printf("❌ %s %s %s %d %v", clientIP, method, path, statusCode, latency)
+			logger.Error("❌ %s %s %s %d %v", clientIP, method, path, statusCode, latency)
 		} else {
-			log.Printf("✅ %s %s %s %d %v", clientIP, method, path, statusCode, latency)
+			logger.Info("✅ %s %s %s %d %v", clientIP, method, path, statusCode, latency)
 		}
 	})
 
@@ -3061,7 +3105,7 @@ func setupAPIRoutes(r *gin.Engine) {
 		}
 
 		go func() {
-			log.Printf("🔄 手动触发浏览器刷新: %s", req.Email)
+			logger.Info("🔄 手动触发浏览器刷新: %s", req.Email)
 			result := register.RefreshCookieWithBrowser(targetAcc, pool.BrowserRefreshHeadless, Proxy)
 			if result.Success {
 				targetAcc.Mu.Lock()
@@ -3083,20 +3127,101 @@ func setupAPIRoutes(r *gin.Engine) {
 				targetAcc.Mu.Unlock()
 
 				if err := targetAcc.SaveToFile(); err != nil {
-					log.Printf("❌ [%s] 保存刷新后的数据失败: %v", req.Email, err)
+					logger.Error("❌ [%s] 保存刷新后的数据失败: %v", req.Email, err)
 				} else {
-					log.Printf("✅ [%s] 刷新数据已保存到文件", req.Email)
+					logger.Info("✅ [%s] 刷新数据已保存到文件", req.Email)
 				}
 				pool.Pool.MarkNeedsRefresh(targetAcc)
-				log.Printf("✅ 手动浏览器刷新成功: %s", req.Email)
+				logger.Info("✅ 手动浏览器刷新成功: %s", req.Email)
 			} else {
-				log.Printf("❌ 手动浏览器刷新失败: %s - %v", req.Email, result.Error)
+				logger.Error("❌ 手动浏览器刷新失败: %s - %v", req.Email, result.Error)
 			}
 		}()
 
 		c.JSON(200, gin.H{
 			"message": "浏览器刷新已触发",
 			"email":   req.Email,
+		})
+	})
+
+	// Flow Token 管理
+	admin.GET("/flow/status", func(c *gin.Context) {
+		if flowTokenPool == nil {
+			c.JSON(200, gin.H{
+				"enabled": false,
+				"message": "Flow 服务未启用",
+			})
+			return
+		}
+		stats := flowTokenPool.Stats()
+		stats["enabled"] = flowHandler != nil
+		c.JSON(200, stats)
+	})
+
+	admin.POST("/flow/add-token", func(c *gin.Context) {
+		if flowTokenPool == nil {
+			c.JSON(503, gin.H{"error": "Flow 服务未启用"})
+			return
+		}
+		var req struct {
+			Cookie string `json:"cookie"`
+		}
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(400, gin.H{"error": err.Error()})
+			return
+		}
+		if req.Cookie == "" {
+			c.JSON(400, gin.H{"error": "需要提供 cookie"})
+			return
+		}
+		tokenID, err := flowTokenPool.AddFromCookie(req.Cookie)
+		if err != nil {
+			c.JSON(400, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(200, gin.H{
+			"message":  "Token 添加成功",
+			"token_id": tokenID,
+			"total":    flowTokenPool.Count(),
+		})
+	})
+
+	admin.POST("/flow/remove-token", func(c *gin.Context) {
+		if flowTokenPool == nil {
+			c.JSON(503, gin.H{"error": "Flow 服务未启用"})
+			return
+		}
+		var req struct {
+			TokenID string `json:"token_id"`
+		}
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(400, gin.H{"error": err.Error()})
+			return
+		}
+		if err := flowTokenPool.RemoveToken(req.TokenID); err != nil {
+			c.JSON(400, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(200, gin.H{
+			"message": "Token 已移除",
+			"total":   flowTokenPool.Count(),
+		})
+	})
+
+	admin.POST("/flow/reload", func(c *gin.Context) {
+		if flowTokenPool == nil {
+			c.JSON(503, gin.H{"error": "Flow 服务未启用"})
+			return
+		}
+		loaded, err := flowTokenPool.LoadFromDir()
+		if err != nil {
+			c.JSON(500, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(200, gin.H{
+			"message": "已重新加载",
+			"loaded":  loaded,
+			"total":   flowTokenPool.Count(),
 		})
 	})
 
@@ -3133,12 +3258,12 @@ func runLocalMode() {
 
 	// 检查 CONFIG_ID
 	if DefaultConfig != "" {
-		log.Printf("✅ 使用默认 configId: %s", DefaultConfig)
+		logger.Info("✅ 使用默认 configId: %s", DefaultConfig)
 	}
 
 	// 检查 API Key 配置
 	if len(appConfig.APIKeys) == 0 {
-		log.Println("⚠️ 未配置 API Key，API 将无鉴权运行")
+		logger.Warn("⚠️ 未配置 API Key，API 将无鉴权运行")
 	}
 
 	// 启动号池管理
@@ -3147,7 +3272,7 @@ func runLocalMode() {
 	}
 	if pool.Pool.TotalCount() == 0 {
 		needCount := appConfig.Pool.TargetCount
-		log.Printf("📝 无账号，启动注册 %d 个...", needCount)
+		logger.Info("📝 无账号，启动注册 %d 个...", needCount)
 		register.StartRegister(needCount)
 	}
 	if appConfig.Pool.CheckIntervalMinutes > 0 {
