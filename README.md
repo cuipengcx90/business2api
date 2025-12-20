@@ -69,7 +69,7 @@
 > 🔗 链接：<https://GLM.openel.top>
 >
 > XiaoMi 网页逆向公益 API
-> 🔗 链接：[https://GLM.openel.top](https://xiaomi.openel.top/)
+> 🔗 链接：[https://xiaomi.openel.top](https://xiaomi.openel.top/)
 >
 >  API Key : `sk-3d2f9b84e7f510b1a08f7b3d6c9a6a7f17fbbad5624ea29f22d9c742bf39c863`
 
